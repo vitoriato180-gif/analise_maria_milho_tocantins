@@ -1,0 +1,698 @@
+---
+title: "Modelo - projeto 2"
+author: "vitoria"
+date: "2026-07-10"
+output: pdf_document
+---
+
+```{r }
+rm(list = ls())
+library(dplyr)
+library(lubridate)
+library(readxl)
+library(factoextra)
+
+data <- read_excel("/Users/mariavitoriadiastorres/Downloads/dados_modelo_final.xlsx")
+# install.packages("factoextra")
+boxplot(data$kgha)
+
+
+```
+
+
+```{r }
+library(factoextra)
+
+# Vamos usar somente a coluna de produtividade (kgha)
+prod <- data %>%
+  select(kgha) %>%
+  filter(!is.na(kgha))
+
+# Definir semente para reprodutibilidade
+#o K-Means escolhe os centroides iniciais de forma aleatória.
+set.seed(123)
+
+
+fviz_nbclust(prod, kmeans, method = "wss") +
+  scale_y_continuous(
+    labels = function(x) paste0(round(x / 1e9, 1))
+  ) +
+  labs(
+    x = "Number of clusters k",
+    y = "Within-group variance"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title    = element_text(face = "bold", color = "#20364C"),
+    plot.subtitle = element_text(color = "#64748B")
+  )
+```
+
+
+Rodando novamente o K-means com o K definido 
+```{r }
+
+set.seed(123)
+
+kmeans_modelo <- kmeans(prod, centers = 3, nstart = 25)
+
+# Adicionar o cluster de volta na base original
+data$Cluster <- kmeans_modelo$cluster
+
+# Ver os centroides de cada grupo 
+centroides <- kmeans_modelo$centers
+cat("Centroides dos grupos:\n")
+print(centroides)
+
+#  Ordenar e rotular do menor para o maior 
+# Lembra: o K-Means é cego para a ordem  precisamos rotular manualmente
+ordem <- order(centroides)
+
+data$Classe_Produtividade <- case_when(
+  data$Cluster == ordem[1] ~ "Baixa",
+  data$Cluster == ordem[2] ~ "Media",
+  data$Cluster == ordem[3] ~ "Alta"
+)
+
+# Transformar em fator com ordem lógica
+data$Classe_Produtividade <- factor(
+  data$Classe_Produtividade,
+  levels = c("Baixa", "Media", "Alta")
+)
+
+# Verificar como ficou a distribuição das classes 
+cat("\nDistribuição das classes:\n")
+print(table(data$Classe_Produtividade))
+
+cat("\nCentroide médio por classe (kg/ha):\n")
+data %>%
+  group_by(Classe_Produtividade) %>%
+  summarise(media_kgha = round(mean(kgha, na.rm = TRUE), 1)) %>%
+  print()
+```
+
+
+
+```{r }
+data %>%
+  group_by(Classe_Produtividade) %>%
+  summarise(
+    minimo = round(min(kgha, na.rm = TRUE), 1),
+    maximo = round(max(kgha, na.rm = TRUE), 1),
+    media  = round(mean(kgha, na.rm = TRUE), 1),
+    n_obs  = n()
+  ) %>%
+print()
+```
+
+
+Vamos fazer uma análise exploratória dos dados e verificar se temos alguma informação inconsistente em nossas variáveis categóricas
+```{r}
+#install.packages("janitor")
+library(janitor)
+#Seleção do nome das variáveis categóricas
+data %>% 
+  select_if(is.factor) %>% 
+  names()
+# classes produtividade 
+data %>% tabyl(Classe_Produtividade) %>% adorn_pct_formatting() %>% arrange(desc(n))
+# ano
+data %>% tabyl(Ano) %>% adorn_pct_formatting() %>% arrange(desc(n))
+#solo 
+data %>% tabyl(Solo) %>% adorn_pct_formatting() %>% arrange(desc(n))
+#tecnologia 
+data %>% tabyl(Tecnologia) %>% adorn_pct_formatting() %>% arrange(desc(n))
+#ciclo
+data %>% tabyl(Ciclo) %>% adorn_pct_formatting() %>% arrange(desc(n))
+# textura do solo
+data %>% tabyl(Textura_do_solo) %>% adorn_pct_formatting() %>% arrange(desc(n))
+
+```
+uma observação para as variaveis tecnologia e ciclo. a variavel tecnologia tem alguns valores abaixo de 0 (talvez devessemos agrupar?) e a variavel ciclo precisa verificar 'SI'
+
+
+Aplicação do random forest
+```{r}
+library(dplyr)
+library(caret)
+library(ranger)
+library(openxlsx)
+
+if (!"DOY_plantio" %in% names(data)) {
+  data <- data %>%
+    mutate(DOY_plantio = as.integer(format(as.Date(Plantio), "%j")))
+  cat("DOY_plantio criado com sucesso!\n")
+} else {
+  cat("DOY_plantio já existe.\n")
+}
+
+data <- data %>%
+  select(-any_of(c(
+    # Identificadores — não são preditores
+    "Cluster", "kgha",
+
+    # Datas POSIXct — DOY_plantio já foi criado
+    "Plantio", "Colheita",
+    "Veg_Inicio", "Veg_Fim",
+    "Rep_Inicio", "Rep_Fim",
+    "Mat_Inicio", "Mat_Fim",
+
+    # Variáveis com dp = 0 reais (se confirmadas)
+    "Veg_Duracao", "Mat_Duracao",
+    "dry_days_fill", "warm_nights_fill",
+    "dry_spell_max_fill", "heat_days35_rep",
+    "gdd_veg" , "gdd_rep",
+    # Redundâncias matemáticas (TIRAMOS OS TOTAIS E MANTEMOS AS FASES)
+    "gdd_cycle",         # <--- GDD Total sai (para evitar colinearidade)
+    "precip_sum_cycle",  # Total sai
+    "wbal_cycle",        # Total sai
+
+    # ETo — contida no wbal
+    "eto_hs_veg", "eto_hs_rep", "eto_hs_fill",
+
+    # Ciclo inconsistente
+    "Ciclo",
+
+    # Leakage geográfico e temporal
+    "Ano", "Ano_num"
+  )))
+
+
+
+cat("Colunas restantes:", ncol(data), "\n")
+cat("Observações      :", nrow(data), "\n")
+cat("\nNomes das colunas:\n")
+print(names(data))
+
+
+data$Cultivar        <- as.factor(data$Cultivar)
+data$Solo            <- as.factor(data$Solo)
+data$Tecnologia      <- as.factor(data$Tecnologia)
+data$Textura_do_solo <- as.factor(data$Textura_do_solo)
+data$Ciclo_Classe    <- as.factor(data$Ciclo_Classe)
+
+# DOY_plantio — criar se não existir
+if (!"DOY_plantio" %in% names(data)) {
+  data <- data %>%
+    mutate(DOY_plantio = as.integer(format(as.Date(Plantio), "%j")))
+}
+
+
+vars_clima <- c(
+  "precip_sum_veg", "precip_sum_rep", "precip_sum_fill",
+  "dry_days_veg", "dry_days_rep",
+  "dry_spell_max_veg", "dry_spell_max_rep",
+  "wbal_veg", "wbal_rep", "wbal_fill",
+  "wdemand_days_rep", "wdemand_days_fill",
+  "tmax_p90_rep",
+  "vpd_high_days_rep", "vpd_p90_rep" 
+)
+
+vars_clima <- vars_clima[vars_clima %in% names(data)]
+cat("\nVariáveis climáticas no modelo:", length(vars_clima), "\n")
+
+formula_modelo <- as.formula(paste(
+  "Classe_Produtividade ~",
+  "Solo + Cultivar + Tecnologia + Textura_do_solo +",
+  "DOY_plantio + Ciclo_Classe +" ,
+  paste(vars_clima, collapse = " + ")
+))
+
+cat("\nFórmula do modelo:\n")
+print(formula_modelo)
+
+n_vars <- length(attr(terms(formula_modelo), "term.labels"))
+cat("\nVariáveis no modelo:", n_vars, "\n")
+cat("mtry máximo seguro :", n_vars, "\n")
+```
+
+```{r }
+set.seed(30)
+idx_final <- createDataPartition(data$Classe_Produtividade, p = 0.7, list = FALSE)
+treino    <- data[idx_final, ]
+teste     <- data[-idx_final, ]
+
+cat("\nDistribuição treino:\n")
+print(prop.table(table(treino$Classe_Produtividade)) * 100)
+cat("\nDistribuição teste:\n")
+print(prop.table(table(teste$Classe_Produtividade)) * 100)
+
+
+calcular_f1_medio <- function(conf_matrix) {
+  mean(conf_matrix$byClass[, "F1"], na.rm = TRUE)
+}
+
+
+mtry_vals <- unique(pmin(c(10, 15, 20, 25), n_vars))
+
+grid_expandido <- expand.grid(
+  num.trees     = c(500, 1000),
+  mtry          = mtry_vals, #número de variáveis para tentar
+  min.node.size = c(3, 5, 10, 15, 20), #define o número mínimo de observações
+  max.depth     = c(10, 15, 20, 25),
+  splitrule     = c("gini", "extratrees"),
+  stringsAsFactors = FALSE
+)
+
+cat("Total de combinações:", nrow(grid_expandido), "\n")
+cat("mtry valores        :", sort(unique(grid_expandido$mtry)), "\n")
+cat("max.depth valores   :", sort(unique(grid_expandido$max.depth)), "\n")
+cat("OK para rodar       :", max(grid_expandido$mtry) <= n_vars, "\n")
+cat("\nTotal de combinações:", nrow(grid_expandido), "\n")
+cat("Modelos totais (×3) :", nrow(grid_expandido) * 3, "\n")
+cat("mtry valores        :", sort(unique(grid_expandido$mtry)), "\n")
+cat("mtry máximo         :", max(grid_expandido$mtry), "\n")
+cat("OK para rodar       :", max(grid_expandido$mtry) <= n_vars, "\n")
+
+
+grid_expandido$Acuracia_media <- NA
+grid_expandido$Kappa_media    <- NA
+grid_expandido$F1_media       <- NA
+
+for (i in 1:nrow(grid_expandido)) {
+  
+  cat("Combinação", i, "de", nrow(grid_expandido), "\n")
+  
+  acuracias <- numeric(3)
+  kappas    <- numeric(3)
+  f1s       <- numeric(3)
+  
+  for (j in 1:3) {
+    set.seed(j * 10)
+    
+    idx_j    <- createDataPartition(data$Classe_Produtividade,
+                                    p = 0.7, list = FALSE)
+    treino_j <- data[idx_j, ]
+    teste_j  <- data[-idx_j, ]
+    
+    modelo <- ranger(
+      formula                   = formula_modelo,
+      data                      = treino_j,
+      num.trees                 = grid_expandido$num.trees[i],
+      mtry                      = grid_expandido$mtry[i],
+      min.node.size             = grid_expandido$min.node.size[i],
+      max.depth                 = grid_expandido$max.depth[i],
+      splitrule                 = grid_expandido$splitrule[i],
+      respect.unordered.factors = "order"
+    )
+    
+    previsao <- predict(modelo, data = teste_j)
+    conf     <- confusionMatrix(
+      data      = previsao$predictions,
+      reference = teste_j$Classe_Produtividade
+    )
+    
+    acuracias[j] <- conf$overall["Accuracy"]
+    kappas[j]    <- conf$overall["Kappa"]
+    f1s[j]       <- calcular_f1_medio(conf)
+  }
+  
+  grid_expandido$Acuracia_media[i] <- round(mean(acuracias, na.rm = TRUE) * 100, 2)
+  grid_expandido$Kappa_media[i]    <- round(mean(kappas,    na.rm = TRUE), 4)
+  grid_expandido$F1_media[i]       <- round(mean(f1s,       na.rm = TRUE), 4)
+}
+
+grid_expandido <- grid_expandido %>%
+  arrange(desc(Acuracia_media), desc(Kappa_media), desc(F1_media))
+
+
+dir.create(
+  "/Users/mariavitoriadiastorres/.local/share/rstudio/notebooks",
+  recursive    = TRUE,
+  showWarnings = FALSE
+)
+
+
+cat("\n=== TOP 10 COMBINAÇÕES ===\n")
+print(head(grid_expandido, 10))
+
+write.xlsx(
+  grid_expandido,
+  "/Users/mariavitoriadiastorres/Downloads/grid_expandido.xlsx",
+  rowNames = FALSE
+)
+
+cat("\nMelhor combinação:\n")
+print(grid_expandido[1, ])
+
+cat("\nArquivo salvo em Downloads/grid_expandido.xlsx\n")
+
+
+
+
+```
+
+```{r }
+
+# MODELO FINAL COM OS MELHORES PARÂMETROS
+
+set.seed(30)
+
+idx_final <- createDataPartition(data$Classe_Produtividade, p = 0.7, list = FALSE)
+treino    <- data[idx_final, ]
+teste     <- data[-idx_final, ]
+
+modelo_final <- ranger(
+  formula                   = formula_modelo,
+  data                      = treino,
+  num.trees                 = 500,
+  mtry                      = 10,
+  min.node.size             = 5,
+  max.depth                 = 10,
+  splitrule                 = "gini",
+  importance                = "impurity",
+  probability               = FALSE,
+  respect.unordered.factors = "order"
+)
+
+previsao_final <- predict(modelo_final, data = teste)
+
+conf_final <- confusionMatrix(
+  data      = previsao_final$predictions,
+  reference = teste$Classe_Produtividade
+)
+
+print(conf_final)
+
+
+```
+
+
+```{r}
+# IMPORTÂNCIA DAS VARIÁVEIS — MODELO SEM LATITUDE/LONGITUDE
+#
+# Correções em relação à versão anterior:
+#   - o modelo é carregado do .rds (não depende do que está na sessão)
+#   - a lista de variáveis climáticas é definida aqui, pelo nome da fase
+#   - NENHUM valor é alterado para "fechar 100%": os grupos são somados
+#     a partir dos valores sem arredondar, e só a exibição é arredondada
+#   - o script para se aparecer variável sem grupo ou LATITUDE/LONGITUDE
+
+library(dplyr)
+library(ggplot2)
+
+# ARQ_MODELO <- "/Users/mariavitoriadiastorres/Downloads/modelo_final_sem_latlon_seed30.rds"
+#dir.create(showWarnings = FALSE, recursive = TRUE)
+
+# modelo_final <- readRDS(ARQ_MODELO)
+cat("Modelo:", "| tipo de importância:", modelo_final$importance.mode, "\n")
+stopifnot(!is.null(modelo_final$variable.importance))
+
+# IMPORTÂNCIA E GRUPOS (utiliza os nomes originais para mapear os grupos)
+vars_agronomicas <- c("Cultivar", "Tecnologia", "Ciclo_Classe", "DOY_plantio")
+vars_solo        <- c("Solo", "Textura_do_solo")
+
+imp <- data.frame(
+  Variavel    = names(modelo_final$variable.importance),
+  Importancia = as.numeric(modelo_final$variable.importance)
+) %>%
+  mutate(
+    Pct   = 100 * Importancia / sum(Importancia),
+    Grupo = case_when(
+      grepl("_(veg|rep|fill|cycle)$", Variavel) ~ "Climate",
+      Variavel %in% vars_solo                   ~ "Soil",
+      Variavel %in% vars_agronomicas            ~ "Agronomic",
+      TRUE                                      ~ "Other"
+    ),
+    Pct_txt = sprintf("%.1f%%", Pct)
+  ) %>%
+  arrange(desc(Pct))
+
+# RECODIFICAÇÃO PARA INGLÊS (feita APÓS a definição dos grupos)
+imp <- imp %>%
+  mutate(Variavel = recode(Variavel,
+    "Cultivar"            = "Cultivar",
+    "precip_sum_rep"      = "Precipitation (rep)",
+    "vpd_p90_rep"         = "VPD P90 (rep)",
+    "Tecnologia"          = "Technology",
+    "wbal_fill"           = "Water balance (fill)",
+    "tmax_p90_rep"        = "Max temp. P90 (rep)",
+    "vpd_high_days_rep"   = "High VPD days (rep)",
+    "DOY_plantio"         = "Sowing date (DOY)",
+    "wbal_rep"            = "Water balance (rep)",
+    "wdemand_days_rep"    = "Water demand days (rep)",
+    "dry_spell_max_rep"   = "Max dry spell (rep)",
+    "dry_days_rep"        = "Dry days (rep)",
+    "precip_sum_fill"     = "Precipitation (fill)",
+    "wbal_veg"            = "Water balance (veg)",
+    "precip_sum_veg"      = "Precipitation (veg)",
+    "dry_days_veg"        = "Dry days (veg)",
+    "Ciclo_Classe"        = "Crop cycle",
+    "dry_spell_max_veg"   = "Max dry spell (veg)",
+    "Textura_do_solo"     = "Soil type",
+    "Solo"                = "Soil",
+    "wdemand_days_fill"   = "Water demand days (fill)"
+  ))
+
+# Conferências
+stopifnot(abs(sum(imp$Pct) - 100) < 1e-8)
+if (any(c("LATITUDE", "LONGITUDE") %in% imp$Variavel))
+  stop("LATITUDE/LONGITUDE ainda estão no modelo: confira o arquivo .rds.")
+if (any(imp$Grupo == "Outra"))
+  stop("Variável sem grupo: ", paste(imp$Variavel[imp$Grupo == "Outra"], collapse = ", "))
+
+# Grupos somados a partir dos valores SEM arredondar
+resumo_grupos <- imp %>%
+  group_by(Grupo) %>%
+  summarise(pct = sum(Pct), n_vars = n(), .groups = "drop") %>%
+  arrange(desc(pct)) %>%
+  mutate(pct_txt = sprintf("%.1f%%", pct))
+
+cat("\nSoma por grupo:\n"); print(resumo_grupos)
+
+cores_grupo <- c("Climate" = "#2471a3", "Agronomic" = "#2E7559", "Soil" = "#c0392b")
+
+# Gráfico 1: Importância relativa por variável
+g1 <- ggplot(imp, aes(x = reorder(Variavel, Pct), y = Pct, fill = Grupo)) +
+  geom_col(alpha = 0.88, width = 0.65) +
+  geom_text(aes(label = Pct_txt), hjust = -0.15, size = 3.2,
+            color = "grey20", fontface = "bold") +
+  coord_flip() +
+  scale_fill_manual(values = cores_grupo) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.18)),
+                     labels = function(x) paste0(x, "%")) +
+  labs(title = "",
+       x = NULL, y = "Relative importance (%)", fill = NULL) +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title          = element_text(face = "bold", size = 13, hjust = 0, color = "#20364C"),
+    axis.text.y         = element_text(face = "bold", size = 10),
+    panel.grid.major.x = element_line(color = "grey88", linewidth = 0.3, linetype = "dotted"),
+    panel.grid.major.y = element_blank(),
+    legend.position    = "bottom",
+    plot.margin        = margin(10, 20, 10, 10)
+  )
+
+print(g1)
+ggsave(paste0(SAIDA, "34_IMPORTANCIA_VARIAVEIS.png"), g1,
+       width = 12, height = 7, dpi = 300, bg = "white")
+
+# Gráfico 2: Importância total por grupo
+g2 <- ggplot(resumo_grupos, aes(x = reorder(Grupo, pct), y = pct, fill = Grupo)) +
+  geom_col(width = 0.55, alpha = 0.88) +
+  geom_text(aes(label = pct_txt), hjust = -0.15, size = 4.5,
+            fontface = "bold", color = "grey15") +
+  coord_flip() +
+  scale_fill_manual(values = cores_grupo) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15)),
+                     labels = function(x) paste0(x, "%")) +
+  labs(x = NULL, y = "Total weight in the model decision (%)") +
+  theme_classic(base_size = 13) +
+  theme(
+    axis.text.y         = element_text(face = "bold", size = 12),
+    panel.grid.major.x = element_line(color = "grey88", linewidth = 0.3, linetype = "dotted"),
+    panel.grid.major.y = element_blank(),
+    legend.position    = "none",
+    plot.margin        = margin(10, 20, 10, 10)
+  )
+
+print(g2)
+ggsave(paste0("34_IMPORTANCIA_GRUPOS.png"), g2,
+       width = 10, height = 5, dpi = 300, bg = "white")
+
+cat("\nfiguras salvas em", ": 34_IMPORTANCIA_VARIAVEIS.png e 34_IMPORTANCIA_GRUPOS.png\n")
+```
+
+
+PORCENTAGEM MATRIZ DE CONFUSÃO 
+```{r}
+# MATRIZ DE CONFUSÃO — MODELO SEM LATITUDE/LONGITUDE (base corrigida, seed 30)
+#
+# Números tirados do confusionMatrix() do caret.
+# ATENÇÃO: no caret as LINHAS são a classe PREVISTA (Prediction) e as COLUNAS
+# são a classe REAL (Reference). Aqui os números estão reescritos com as
+# LINHAS = classe REAL.
+#
+# Cores: acertos (diagonal) em cinza claro; erros de branco (0%) a vermelho
+# escuro (quanto mais escuro, maior o erro).
+
+library(dplyr)
+library(ggplot2)
+
+SAIDA <- "figuras/modelo_corrigido/"
+dir.create(SAIDA, showWarnings = FALSE, recursive = TRUE)
+
+
+cm_df <- data.frame(
+  Real     = factor(rep(c("Baixa", "Media", "Alta"), each = 3),
+                    levels = c("Alta", "Media", "Baixa")),
+  Prevista = factor(rep(c("Baixa", "Media", "Alta"), 3),
+                    levels = c("Baixa", "Media", "Alta")),
+  n        = c(90,  23,   0,    # Real = Baixa
+               16, 121,  28,    # Real = Média
+                0,  32, 118)    # Real = Alta
+) %>%
+  group_by(Real) %>%
+  mutate(pct    = 100 * n / sum(n),
+         rotulo = sprintf("%d\n(%.1f%%)", n, pct)) %>%
+  ungroup() %>%
+  mutate(acerto    = as.character(Real) == as.character(Prevista),
+         pct_erro  = ifelse(acerto, NA, pct),                 # só os erros entram na escala
+         cor_texto = ifelse(!acerto & pct >= 12, "white", "black"))
+
+tot <- cm_df %>% group_by(Real) %>% summarise(total = sum(n), .groups = "drop")
+print(tot)
+
+stopifnot(all(sort(tot$total) == sort(c(113, 165, 150))),   # totais da classe real no teste
+          sum(cm_df$n) == 428,                               # total de parcelas no teste
+          sum(cm_df$n[cm_df$acerto]) == 329)                 # acertos atualizados: 90 + 121 + 118             # acertos: 91 + 120 + 114
+
+# MÉTRICAS: acurácia, Kappa e Kappa ponderado
+cm <- xtabs(n ~ Real + Prevista, data = cm_df)
+cm <- cm[c("Baixa", "Media", "Alta"), c("Baixa", "Media", "Alta")]   # ordem Baixa, Média, Alta
+print(cm)
+
+cat("\nPorcentagem da classe real (cada linha soma 100%):\n")
+print(round(100 * prop.table(cm, margin = 1), 1))
+
+po <- sum(diag(cm)) / sum(cm)
+pe <- sum(rowSums(cm) * colSums(cm)) / sum(cm)^2
+cat(sprintf("\nAcurácia: %.1f%%   Kappa: %.3f\n", 100 * po, (po - pe) / (1 - pe)))
+
+# Kappa ponderado (pesos lineares: errar 1 classe = meio erro; errar 2 = erro inteiro)
+k  <- nrow(cm)
+W  <- 1 - abs(outer(1:k, 1:k, "-")) / (k - 1)
+P  <- cm / sum(cm)
+E  <- outer(rowSums(P), colSums(P))
+kappa_ponderado <- (sum(W * P) - sum(W * E)) / (1 - sum(W * E))
+cat(sprintf("Kappa ponderado (linear): %.3f\n", kappa_ponderado))
+
+g_cm <- ggplot(cm_df, aes(Prevista, Real)) +
+  # erros: de branco (0%) a vermelho escuro
+  geom_tile(aes(fill = pct_erro), colour = "white", linewidth = 1.5) +
+  # acertos: cor clara fixa, com borda
+  geom_tile(data = filter(cm_df, acerto), fill = "#EEF3F7",
+            colour = "grey55", linewidth = 0.8) +
+  geom_text(aes(label = rotulo, colour = cor_texto), size = 5, fontface = "bold") +
+  scale_colour_identity() +
+  scale_fill_gradient(low = "white", high = "#8B0000",
+                      limits = c(0, 25), oob = scales::squish, na.value = "#EEF3F7",
+                      name = "% de erro\n(da classe real)") +
+  scale_x_discrete(position = "top", labels = c("Baixa", "Média", "Alta")) +
+  scale_y_discrete(labels = c(Alta = "Alta", Media = "Média", Baixa = "Baixa")) +
+  labs(x = "Classe prevista", y = "Classe real",
+       title = "",
+       caption = "") +
+  theme_minimal(base_size = 13) +
+  theme(panel.grid = element_blank(),
+        plot.caption = element_text(hjust = 0, colour = "grey40", size = 9))
+
+print(g_cm)
+ggsave(paste0(SAIDA, "33_MATRIZ_CONFUSAO.png"), g_cm,
+       width = 7, height = 5.5, dpi = 300, bg = "white")
+cat
+```
+
+
+```{r}
+# DENSIDADE DAS DATAS DE PLANTIO — POR SOLO, COM A MODA DE CADA SOLO
+# Reunião 30/09: tirar a curva geral e a linha de 28/fev; marcar a moda
+# de cada solo (pico da densidade, ignorando o ano).
+# Modas encontradas: Latossolo 24/02 (DOY 55) · Plintossolo 03/03 (DOY 62)
+
+
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+
+dir.create("figuras", showWarnings = FALSE)
+
+cores_fill  <- c("Latossolo" = "#8b1a1a", "Plintossolo" = "#b8946a")
+cores_linha <- c("Latossolo" = "#5c0f0f", "Plintossolo" = "#6b5438")
+
+data_plantio <- read_excel(
+  "/Users/mariavitoriadiastorres/Downloads/dados_modelo_final.xlsx"
+) %>%
+  mutate(
+    DOY_plantio = yday(Plantio),
+    Ano         = as.factor(as.integer(Ano))
+  ) %>%
+  filter(!is.na(DOY_plantio), !is.na(Ano))
+
+dens_dados <- data_plantio %>%
+  filter(!is.na(Plantio), !is.na(Solo)) %>%
+  mutate(DOY_plantio = yday(Plantio))
+
+bw_comum <- bw.nrd0(dens_dados$DOY_plantio)
+
+# Moda de cada solo = pico da curva de densidade
+modas <- dens_dados %>%
+  group_by(Solo) %>%
+  summarise(doy_moda = {
+    d <- density(DOY_plantio, bw = bw_comum)
+    d$x[which.max(d$y)]
+  }, .groups = "drop") %>%
+  mutate(doy_moda = round(doy_moda),
+         rotulo   = paste0("Moda ", Solo, ": ",
+                           format(as.Date(doy_moda - 1, origin = "2023-01-01"), "%d/%m")))
+print(modas)
+
+# Eixo x: datas de referência (DOY de ano não bissexto)
+breaks_doy    <- c(43, 50, 55, 62, 66, 73)
+labels_breaks <- c("12/fev", "19/fev", "24/fev", "03/mar", "07/mar", "14/mar")
+
+g_densidade_solo <- ggplot(dens_dados,
+                           aes(x = DOY_plantio, y = after_stat(count),
+                               fill = Solo, color = Solo)) +
+  geom_density(alpha = 0.35, linewidth = 0.9, bw = bw_comum) +
+  
+  # Linha vertical na moda de cada solo
+  geom_vline(data = modas, aes(xintercept = doy_moda, color = Solo),
+             linetype = "dashed", linewidth = 0.9, show.legend = FALSE) +
+  geom_label(data = modas,
+             aes(x = doy_moda, y = Inf, label = rotulo, color = Solo),
+             vjust = 1.3, hjust = ifelse(modas$Solo == "Latossolo", 1.05, -0.05),
+             size = 3.3, fontface = "italic", fill = "white",
+             label.size = 0, show.legend = FALSE, inherit.aes = FALSE) +
+  
+  scale_fill_manual(values = cores_fill) +
+  scale_color_manual(values = cores_linha) +
+  scale_x_continuous(breaks = breaks_doy, labels = labels_breaks,
+                     limits = c(38, 82)) +
+  
+  labs(
+    title    = "Densidade das datas de plantio por tipo de solo",
+    subtitle = "",
+    x = "Data de plantio", y = "Densidade (proporcional ao nº de parcelas)",
+    fill = NULL, color = NULL
+  ) +
+  
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title         = element_text(face = "bold", size = 13, hjust = 0, color = "#20364C"),
+    plot.subtitle      = element_text(size = 10, color = "grey40", hjust = 0,
+                                      margin = margin(b = 10)),
+    axis.text.x        = element_text(size = 10, angle = 30, hjust = 1, face = "bold"),
+    axis.text.y        = element_blank(),
+    axis.ticks.y       = element_blank(),
+    axis.title         = element_text(face = "bold"),
+    panel.grid.major.x = element_line(color = "grey90", linewidth = 0.3, linetype = "dotted"),
+    legend.position    = "bottom",
+    legend.text        = element_text(size = 10),
+    plot.margin        = margin(12, 16, 10, 10)
+  )
+
+print(g_densidade_solo)
+ggsave("figuras/11_DENSIDADE_PLANTIO_SOLO.png", plot = g_densidade_solo,
+       width = 10, height = 5.5, dpi = 300, bg = "white")
+```
